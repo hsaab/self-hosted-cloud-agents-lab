@@ -1,0 +1,50 @@
+{
+  "family": "cursor-self-hosted-worker",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/cursor-worker-task-execution-role",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/cursor-worker-task-role",
+  "containerDefinitions": [
+    {
+      "name": "worker",
+      "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/cursor-self-hosted-worker:latest",
+      "essential": true,
+      "environment": [
+        {
+          "name": "CURSOR_WORKER_POOL_NAME",
+          "value": "lab"
+        },
+        {
+          "name": "CURSOR_WORKER_IDLE_RELEASE_TIMEOUT",
+          "value": "600"
+        },
+        {
+          "name": "CURSOR_WORKER_MANAGEMENT_ADDR",
+          "value": "0.0.0.0:8080"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "CURSOR_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:cursor/service-account-api-key"
+        }
+      ],
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/cursor-self-hosted-worker",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "worker"
+        }
+      }
+    }
+  ]
+}

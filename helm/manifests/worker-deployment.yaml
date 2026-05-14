@@ -1,0 +1,60 @@
+apiVersion: workers.cursor.com/v1
+kind: WorkerDeployment
+metadata:
+  name: my-workers
+  namespace: cursord
+spec:
+  auth:
+    apiKeySecretRef:
+      name: my-workers-api-key
+      key: api-key
+    workerContainerName: worker
+  readyReplicas: 1
+  template:
+    metadata:
+      labels:
+        app: cursor-self-hosted-worker
+    spec:
+      containers:
+        - name: worker
+          image: YOUR_IMAGE
+          command: ["agent"]
+          args:
+            - "worker"
+            - "--pool"
+            - "lab"
+            - "--idle-release-timeout"
+            - "600"
+            - "--worker-dir"
+            - "/workspace"
+            - "--auth-token-file"
+            - "/var/run/cursor/token"
+            - "--management-addr"
+            - "0.0.0.0:8080"
+            - "--labels-file"
+            - "/etc/cursor/labels.json"
+            - "start"
+          ports:
+            - name: management
+              containerPort: 8080
+          volumeMounts:
+            - name: worker-labels
+              mountPath: /etc/cursor
+              readOnly: true
+      volumes:
+        - name: worker-labels
+          configMap:
+            name: cursor-worker-labels
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cursor-worker-labels
+  namespace: cursord
+data:
+  labels.json: |
+    {
+      "environment": "lab",
+      "runtime": "kubernetes",
+      "owner": "local-experiment"
+    }
