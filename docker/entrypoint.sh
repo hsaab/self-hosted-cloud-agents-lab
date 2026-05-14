@@ -13,8 +13,8 @@ LABELS_FILE="${CURSOR_WORKER_LABELS_FILE:-/etc/cursor/labels.json}"
 
 args=(
   worker
-  start
-  --pool "${POOL_NAME}"
+  --pool
+  --pool-name "${POOL_NAME}"
   --worker-dir "${WORKER_DIR}"
   --idle-release-timeout "${IDLE_TIMEOUT}"
 )
@@ -26,5 +26,7 @@ fi
 if [[ -n "${CURSOR_WORKER_MANAGEMENT_ADDR:-}" ]]; then
   args+=(--management-addr "${CURSOR_WORKER_MANAGEMENT_ADDR}")
 fi
+
+args+=(start)
 
 exec agent "${args[@]}"

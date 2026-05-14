@@ -1,19 +1,28 @@
 # Self-Hosted Cloud Agents Lab
 
-This repo is a sandbox for trying Cursor Self-Hosted Pool workers with a shared worker image and three deployment approaches: EC2, Helm/Kubernetes, and ECS.
+This repository demonstrates how to run Cursor Cloud Agents on customer-managed infrastructure with self-hosted worker pools.
 
-## What This Is
+Cursor still handles orchestration, model inference, and the Cloud Agents experience. The worker runs inside your environment and executes the operational work: cloning repos, running shell commands, editing files, running builds/tests, and reaching internal services that are not available from Cursor-hosted infrastructure.
 
-Cursor Self-Hosted Pool workers run the agent workspace, shell commands, tool calls, builds, and tests inside your infrastructure while Cursor still handles orchestration and inference. Workers require a Cursor service account API key; user, team, or org API keys are not enough for pool workers.
+## What This Shows
+
+- A shared Docker image that installs the Cursor `agent` CLI and starts a pool worker.
+- A direct EC2 deployment that provisions AWS infrastructure with Terraform.
+- A Helm/Kubernetes path for customers that already run Kubernetes.
+- An ECS/Fargate scaffold for customers that prefer managed container scheduling.
+
+Workers connect outbound to Cursor over HTTPS. No inbound access to the worker is required.
 
 ## Prerequisites
 
 - Docker
-- Cursor `agent` CLI support inside the image
-- A Cursor service account API key
+- A Cursor Enterprise workspace with Self-Hosted Cloud Agents enabled
+- A Cursor service account API key for pool workers
+- The Cursor GitHub App installed with access to target repositories
 - `kubectl` and `helm` for the Helm/Kubernetes approach
-- AWS CLI configured locally for the EC2 and ECS approaches
-- Terraform for the EC2 scaffold
+- AWS CLI and Terraform for the EC2 and ECS approaches
+
+Pool workers require a **service account API key**. Personal, user, team, member, and general organization API keys are rejected by the worker CLI.
 
 ## Repo Layout
 
@@ -21,49 +30,78 @@ Cursor Self-Hosted Pool workers run the agent workspace, shell commands, tool ca
 .
 ├── config/              # Shared worker labels and local config examples
 ├── docker/              # Shared worker image and entrypoint
-├── ec2/terraform/       # EC2-focused Terraform scaffold
+├── ec2/terraform/       # EC2-focused Terraform deployment
 ├── ecs/                 # ECS/Fargate approach notes and examples
 └── helm/                # Helm values, Kubernetes manifests, and helper scripts
 ```
 
-## Suggested Workflow
+## Quick Start
 
 1. Copy `.env.example` to `.env` and fill in local values.
-2. Build the Docker worker image:
+2. Build and smoke-test the worker image locally:
 
    ```bash
    make docker-build
-   ```
-
-3. Run a single Docker worker locally:
-
-   ```bash
    make docker-run
    ```
 
-4. When a Kubernetes cluster is available, install the controller:
+3. For an EC2 demo, provision AWS, upload the service account key, and push the image:
+
+   ```bash
+   make ec2-terraform-init
+   make ec2-terraform-plan
+   make ec2-terraform-apply
+   make ec2-put-api-key-secret
+   make ecr-build-push
+   ```
+
+4. For Kubernetes, install the controller, create the API key secret, and apply the worker deployment:
 
    ```bash
    make helm-install-controller
-   ```
-
-5. Create the service account API key secret:
-
-   ```bash
    make helm-create-api-key-secret
-   ```
-
-6. Apply the worker deployment:
-
-   ```bash
    make helm-apply
    ```
 
-7. For AWS alternatives, use `ec2/` and `ecs/` as separate starting points. Both are scaffolds until reviewed and wired to real AWS resources.
+## Deployment Approaches
+
+- `ec2/` provisions a single long-lived EC2 host that runs the worker container directly with Docker. This is the simplest customer demo path.
+- `helm/` installs the official Kubernetes controller and applies a `WorkerDeployment`. This is the best fit for teams that already operate Kubernetes.
+- `ecs/` is a starting point for a Fargate or ECS service deployment.
+
+## Operational Model
+
+For the EC2 path, Terraform creates the infrastructure but does not store the Cursor API key value in Terraform state. The secret value is uploaded separately from `.env` into Secrets Manager. On boot, EC2 user data fetches that value, writes an env file on the host, and starts the worker container with Docker `--env-file`.
+
+The worker registers itself with Cursor using:
+
+- The repo derived from the worker directory's git remote.
+- The pool name from `CURSOR_WORKER_POOL_NAME`.
+- Optional labels from `config/labels.json`.
+
+## Verification
+
+For EC2, use SSM to inspect the host without opening SSH:
+
+```bash
+aws ssm start-session --region "$AWS_REGION" --target "<instance-id>"
+sudo docker logs -f cursor-worker
+```
+
+A healthy worker log includes:
+
+```text
+Worker is now running
+Registering to worker pool
+Repo: <owner>/<repo>
+Pool: <pool-name>
+```
 
 ## Secrets
 
 Do not commit real API keys, kubeconfigs, Terraform state, or `.env` files. The helper scripts read values from environment variables so secrets can stay in your shell, secret manager, or CI environment.
+
+If a service account key is exposed in logs or command history, rotate it.
 
 ## Notes
 
@@ -72,9 +110,3 @@ Do not commit real API keys, kubeconfigs, Terraform state, or `.env` files. The 
 - The example worker deployment is named `my-workers`.
 - Reserved worker labels include `repo` and `pool`; avoid setting those manually in shared or approach-specific label files.
 - Workers need outbound HTTPS access to Cursor APIs, Cursor downloads, and Cursor cloud-agent artifacts.
-
-## Approach Status
-
-- `helm/` is the most complete path today. It installs the official controller and applies a `WorkerDeployment`.
-- `ec2/terraform/` is a non-provisioning scaffold for a direct EC2 worker host approach.
-- `ecs/` is a scaffold for a Fargate or ECS service approach and includes a task definition example.
