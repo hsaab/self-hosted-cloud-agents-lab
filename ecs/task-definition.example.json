@@ -14,7 +14,7 @@
       "environment": [
         {
           "name": "CURSOR_WORKER_POOL_NAME",
-          "value": "lab"
+          "value": "ecs-lab"
         },
         {
           "name": "CURSOR_WORKER_IDLE_RELEASE_TIMEOUT",
@@ -23,6 +23,18 @@
         {
           "name": "CURSOR_WORKER_MANAGEMENT_ADDR",
           "value": "0.0.0.0:8080"
+        },
+        {
+          "name": "CURSOR_WORKER_DIR",
+          "value": "/workspace"
+        },
+        {
+          "name": "WORKER_REPOSITORY_URL",
+          "value": "https://github.com/OWNER/REPO.git"
+        },
+        {
+          "name": "CURSOR_WORKER_LABELS_JSON",
+          "value": "{\"environment\":\"lab\",\"infrastructure\":\"ecs\",\"runtime\":\"ecs-fargate\",\"owner\":\"local-experiment\"}"
         }
       ],
       "secrets": [
@@ -37,6 +49,13 @@
           "protocol": "tcp"
         }
       ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {

@@ -10,9 +10,9 @@ NAMESPACE="${K8S_NAMESPACE:-cursord}"
 SECRET_NAME="${CURSOR_API_KEY_SECRET_NAME:-my-workers-api-key}"
 WORKER_DEPLOYMENT_NAME="${WORKER_DEPLOYMENT_NAME:-my-workers}"
 
-kubectl create namespace "${NAMESPACE}" \
-  --dry-run=client \
-  -o yaml | kubectl apply -f -
+if ! kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+  kubectl create namespace "${NAMESPACE}"
+fi
 
 kubectl create secret generic "${SECRET_NAME}" \
   --from-literal=api-key="${CURSOR_API_KEY}" \

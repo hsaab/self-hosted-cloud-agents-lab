@@ -32,6 +32,161 @@ The default worker image platform is `linux/amd64`, which matches `t3`/`t3a` ins
 
 `WORKER_REPOSITORY_URL` defaults to the local git remote origin and is used only so the worker workspace has a git origin for Cursor's startup checks.
 
+## Customer Step-By-Step: Docker On EC2
+
+Use this sequence when walking a customer through the direct EC2 path.
+
+### 1. Confirm Cursor prerequisites
+
+In Cursor, confirm the customer has:
+
+- Self-Hosted Cloud Agents enabled for the workspace.
+- A service account API key created from Service Accounts settings.
+- The Cursor GitHub App installed with access to the target repository.
+- A pool name they want to route jobs to, such as `lab`, `staging`, or `build-fleet`.
+
+The service account key is required for pool workers. A normal member, user, personal, team, or organization API key will not work.
+
+### 2. Configure local environment
+
+Copy the example env file and fill in customer-specific values:
+
+```bash
+cp .env.example .env
+```
+
+Required EC2 values:
+
+```bash
+CURSOR_API_KEY=<service-account-api-key>
+CURSOR_WORKER_POOL_NAME=<pool-name>
+WORKER_ENVIRONMENT_LABEL=lab
+WORKER_OWNER_LABEL=platform-team
+EC2_WORKER_INFRASTRUCTURE_LABEL=ec2
+AWS_PROFILE=<aws-cli-profile>
+AWS_REGION=<aws-region>
+ECR_REPOSITORY_NAME=cursor-self-hosted-worker
+EC2_INSTANCE_TYPE=t3.small
+EC2_WORKER_HOST_NAME=cursor-worker-lab
+```
+
+`WORKER_REPOSITORY_URL` can stay empty. The Makefile defaults it to the local git remote origin.
+
+The worker registers with Cursor using the reserved labels `repo=<repo>` and `pool=<pool-name>`. EC2 also passes custom labels through `CURSOR_WORKER_LABELS_JSON`, so Cursor should show values like `infrastructure=ec2`, `runtime=ec2-docker`, `environment=lab`, and `owner=platform-team`.
+
+### 3. Authenticate to AWS
+
+Use the customer's preferred AWS auth flow. For local demos:
+
+```bash
+aws login --profile "$AWS_PROFILE"
+aws sts get-caller-identity --profile "$AWS_PROFILE"
+```
+
+The Makefile exports temporary credentials for Terraform with `aws configure export-credentials`, which avoids storing static AWS keys in the repo.
+
+### 4. Review the Terraform plan
+
+Initialize and plan before creating anything:
+
+```bash
+make ec2-terraform-init
+make ec2-terraform-plan
+```
+
+The plan should show one EC2 instance, one ECR repository, one Secrets Manager secret container, IAM resources, and a no-inbound security group.
+
+### 5. Apply the AWS infrastructure
+
+Create the AWS resources:
+
+```bash
+make ec2-terraform-apply
+```
+
+Terraform creates the Secrets Manager secret metadata, but it does not put the Cursor API key value in Terraform state.
+
+### 6. Upload the Cursor service account key
+
+Write the key from `.env` into Secrets Manager:
+
+```bash
+make ec2-put-api-key-secret
+```
+
+This keeps the key out of committed files and Terraform state.
+
+### 7. Build and push the worker image
+
+Build the Docker image and push it to ECR:
+
+```bash
+make ecr-build-push
+```
+
+By default this builds `linux/amd64`, which matches `t3` and `t3a` instance types.
+
+### 8. Let EC2 bootstrap the container
+
+On boot, EC2 user data installs Docker, fetches the service account key from Secrets Manager, creates `/etc/cursor/worker.env`, pulls the image from ECR, and starts the worker container.
+
+If the instance was created before the secret value or image existed, rerun the bootstrap script or reboot after completing steps 6 and 7:
+
+```bash
+aws ssm start-session --region "$AWS_REGION" --target "<instance-id>"
+sudo /var/lib/cloud/instance/scripts/part-001
+```
+
+### 9. Validate the worker on EC2
+
+Connect over SSM and check Docker:
+
+```bash
+aws ssm start-session --region "$AWS_REGION" --target "<instance-id>"
+sudo docker ps --filter name=cursor-worker
+sudo docker logs -f cursor-worker
+```
+
+Expected healthy log:
+
+```text
+Worker is now running
+Registering to worker pool
+Repo: <owner>/<repo>
+Pool: <pool-name>
+```
+
+### 10. Start a Cloud Agent job
+
+In Cursor Cloud Agents:
+
+1. Select the repository.
+2. Select Self Hosted.
+3. Select the pool name from `.env`.
+4. Start a test prompt.
+
+The worker connects outbound to Cursor and claims work from the pool. No inbound EC2 ports need to be opened.
+
+### 11. Rotate or replace the service account key
+
+After changing `CURSOR_API_KEY` in `.env`:
+
+```bash
+make ec2-put-api-key-secret
+```
+
+Then recreate the container so Docker reads the updated env file. A plain restart does not reload `--env-file` values.
+
+### 12. Clean up after the demo
+
+To stop AWS spend:
+
+```bash
+terraform -chdir=ec2/terraform destroy
+```
+
+Confirm the EC2 instance, ECR repository, IAM resources, security group, and secret metadata are removed.
+
 ## How The Worker Starts
 
 On first boot, `user_data.sh.tpl` runs on the EC2 host and:

@@ -57,6 +57,24 @@ variable "worker_idle_release_timeout" {
   default     = 600
 }
 
+variable "worker_environment_label" {
+  description = "Cursor worker environment label value."
+  type        = string
+  default     = "lab"
+}
+
+variable "worker_infrastructure_label" {
+  description = "Cursor worker infrastructure label value."
+  type        = string
+  default     = "ec2"
+}
+
+variable "worker_owner_label" {
+  description = "Cursor worker owner label value."
+  type        = string
+  default     = "local-experiment"
+}
+
 variable "cursor_worker_management_addr" {
   description = "Optional management address passed to the worker container. Leave empty for no management listener."
   type        = string
