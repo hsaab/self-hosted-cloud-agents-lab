@@ -2,7 +2,7 @@
 
 Use this guide to stand up Cursor self-hosted Cloud Agent workers on Amazon EKS from scratch.
 
-This path uses the shared worker image in `docker/`, pushes that image to ECR, installs the official Cursor worker-set controller Helm chart, and applies a generated `WorkerDeployment`.
+This path uses the shared worker image in `docker/`, pushes that image to ECR, installs the official Cursor worker-set controller Helm chart, and applies a generated `WorkerDeployment`. The Helm values, manifests, labels, and helper scripts live in `eks/helm/`.
 
 ## Architecture
 

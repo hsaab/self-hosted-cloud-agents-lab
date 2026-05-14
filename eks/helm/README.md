@@ -1,4 +1,4 @@
-# Helm Approach
+# EKS Helm Implementation
 
 Use this approach when you already have a Kubernetes cluster and want to run Cursor self-hosted workers through the official worker-set controller.
 

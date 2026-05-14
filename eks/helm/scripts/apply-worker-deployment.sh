@@ -11,6 +11,10 @@ if [[ "${LABELS_FILE}" != /* ]]; then
   LABELS_FILE="${REPO_ROOT}/${LABELS_FILE}"
 fi
 
+if [[ ! -f "${LABELS_FILE}" && "${LABELS_FILE}" == "${REPO_ROOT}/helm/"* ]]; then
+  LABELS_FILE="${REPO_ROOT}/eks/${LABELS_FILE#"${REPO_ROOT}/"}"
+fi
+
 if [[ ! -f "${LABELS_FILE}" ]]; then
   echo "K8S_WORKER_LABELS_FILE does not exist: ${LABELS_FILE}" >&2
   exit 1
