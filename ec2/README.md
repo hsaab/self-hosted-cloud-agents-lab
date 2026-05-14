@@ -1,8 +1,6 @@
 # EC2 + Docker Guide
 
-Use this README for the general EC2 architecture, operating model, validation expectations, and troubleshooting paths.
-
-Use [`terraform/README.md`](terraform/README.md) when you need the customer-facing implementation runbook with step-by-step commands.
+Use this README to understand the EC2 architecture, operating model, validation expectations, and troubleshooting paths. Use [`terraform/README.md`](terraform/README.md) for the customer-facing setup runbook with step-by-step commands.
 
 ## When To Use EC2
 
@@ -10,7 +8,7 @@ The EC2 + Docker path is the smallest AWS footprint in this lab. It is a good fi
 
 Use ECS or Kubernetes instead when the customer needs autoscaling, multiple warm workers, rolling updates, cluster-level scheduling, or stronger separation between teams and workloads.
 
-## How The Docs Are Split
+## Documentation Map
 
 - This README: architecture, resource summary, security model, operations, validation, and troubleshooting.
 - [`terraform/README.md`](terraform/README.md): customer prerequisites, `.env` setup, Terraform commands, image publishing, worker validation, updates, key rotation, and cleanup.

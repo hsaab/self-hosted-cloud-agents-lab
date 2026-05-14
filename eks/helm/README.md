@@ -1,8 +1,8 @@
-# EKS Helm Implementation
+# EKS Helm Assets
 
-Use this approach when you already have a Kubernetes cluster and want to run Cursor self-hosted workers through the official worker-set controller.
+Use this README when you already have a Kubernetes cluster and need to understand the Helm targets, generated manifests, and local smoke-test flow. For the end-to-end EKS customer runbook, start with [`../README.md`](../README.md).
 
-This path mirrors the EC2 demo but uses the Cursor controller Helm chart from the docs to manage Kubernetes `WorkerDeployment` resources.
+The Helm path installs the official Cursor worker-set controller and applies a generated Kubernetes `WorkerDeployment` for the shared worker image.
 
 ## What Gets Installed
 
@@ -43,7 +43,7 @@ K8S_WORKER_IMAGE="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSIT
 
 ## Local Kind Smoke Test
 
-This repo was validated locally with `kind` using the official Cursor controller chart and the local worker image.
+For local validation, use `kind` with the official Cursor controller chart and the local worker image.
 
 If `helm` or `kind` are missing:
 
@@ -67,7 +67,7 @@ make helm-create-api-key-secret
 make helm-apply
 ```
 
-The live validation used:
+Validate the local deployment:
 
 ```bash
 kubectl get pods -n "$K8S_NAMESPACE"
@@ -80,8 +80,8 @@ Expected healthy output:
 ```text
 Worker is now running
 Registering to worker pool
-Repo: hsaab/self-hosted-cloud-agents-lab
-Pool: hsaab-worker-pool
+Repo: <owner>/<repo>
+Pool: <pool-name>
 ```
 
 ## How The Worker Starts
@@ -155,7 +155,7 @@ To automate that scaling from Cursor worker metrics, install the Prometheus-base
 make helm-install-autoscaling
 ```
 
-This creates a `cursor-worker-metrics` Service for the worker `/metrics` endpoint, installs Prometheus, and runs a scaler CronJob that reads `cursor_self_hosted_worker_connected` and `cursor_self_hosted_worker_session_active`. The scaler patches `WorkerDeployment.spec.readyReplicas` between `WORKER_MIN_REPLICAS` and `WORKER_MAX_REPLICAS`.
+This creates a `cursor-worker-metrics` Service for the worker `/metrics` endpoint, installs Prometheus, and runs a scaler CronJob. The customer-facing behavior and tuning guidance live in [`../README.md`](../README.md).
 
 After rotating the service account key:
 
@@ -170,7 +170,7 @@ If the controller recreates pods automatically after the secret update, a manual
 
 ### Helm Or Kind Is Missing
 
-The live local run initially failed because `helm` was not installed, and there was no local cluster helper installed. Install both with:
+Install both tools for local smoke tests:
 
 ```bash
 brew install helm kind
@@ -251,9 +251,7 @@ kubectl get jobs -n "$K8S_NAMESPACE" | rg cursor-worker-metrics-scaler
 
 If Prometheus is pending with an unbound PVC, install with the repo helper. It disables Prometheus persistence for the lab so EKS clusters without a default StorageClass still work. If the scaler logs show `connected=0`, check that workers are started with `--management-addr 0.0.0.0:8080` and that the `cursor-worker-metrics` Service has endpoints.
 
-Do not use a plain HPA or KEDA `ScaledObject` directly against `WorkerDeployment` without validating it first. The Cursor CRD exposes `/scale`, but its scale status does not include a selector, and Kubernetes HPA can reject the target with `selector is required`. The repo helper uses a CronJob scaler that patches the `WorkerDeployment` scale endpoint directly.
-
-Prometheus can briefly retain metrics for deleted worker pods. The scaler filters metrics through the live `up{service="cursor-worker-metrics"}` targets so deleted pods do not inflate the connected-worker denominator.
+Do not use a plain HPA or KEDA `ScaledObject` directly against `WorkerDeployment` without validating it first. The customer guide explains the CRD scale limitations and the CronJob scaler behavior.
 
 ### Initial Kind Scheduling Warning
 
@@ -272,5 +270,10 @@ Remove the controller release and namespace:
 ```bash
 helm uninstall "$CURSOR_CONTROLLER_RELEASE_NAME" -n "$K8S_NAMESPACE"
 kubectl delete namespace "$K8S_NAMESPACE"
+```
+
+If you created the local kind cluster, delete it too:
+
+```bash
 kind delete cluster --name cursor-helm-lab
 ```

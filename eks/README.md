@@ -59,7 +59,7 @@ CURSOR_API_KEY_SECRET_NAME=my-workers-api-key
 K8S_WORKER_LABELS_FILE=eks/helm/labels.json
 ```
 
-Use a pool name that includes `eks`, such as `acme-eks-worker-pool`, so the pool is easy to identify in Cursor's Self Hosted picker.
+Use a pool name that includes `eks`, such as `acme-eks-worker-pool`, so the pool is easy to identify in Cursor's Self-Hosted picker.
 
 Set `WORKER_REPOSITORY_URL` if the local repo remote is not the customer repo that Cloud Agents should work on:
 
@@ -210,17 +210,7 @@ Repo: <owner>/<repo>
 Pool: <pool-name>
 ```
 
-Then open Cursor Cloud Agents, choose **Self Hosted**, and start a test job against the repo that matches `WORKER_REPOSITORY_URL`.
-
-The live EKS validation in this repo used:
-
-```text
-EKS cluster: cursor-agents-lab
-EKS namespace: hsaab-eks-worker-pool
-WorkerDeployment: hsaab-eks-worker-deployment
-Worker image: 500766168271.dkr.ecr.us-east-1.amazonaws.com/cursor-self-hosted-worker:latest
-Cursor pool: hsaab-eks-worker-pool
-```
+Then open Cursor Cloud Agents, choose **Self-Hosted**, and start a test job against the repo that matches `WORKER_REPOSITORY_URL`.
 
 ## Step 9: Update Or Scale Workers
 

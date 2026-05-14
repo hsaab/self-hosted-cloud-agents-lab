@@ -279,18 +279,9 @@ On each run, the Lambda:
 
 New workers are created by ECS, not by the Lambda directly. The Lambda only changes the ECS service desired count. ECS then starts another Fargate task from the task definition, and the task registers as another Cursor worker after the container starts.
 
-### Is This Enterprise Ready?
+### Production Readiness Notes
 
-This pattern is a practical ECS/Fargate control loop for teams that want to stay inside AWS-native primitives: EventBridge, Lambda, CloudWatch, Secrets Manager, ECS, and Application Auto Scaling. It is much simpler than running a Prometheus stack only to make scaling decisions for a small Fargate pool.
-
-For larger enterprise deployments, harden or replace parts of it based on platform standards:
-
-- Use one ECS service and Cursor pool per team, repo group, environment, or hardware profile so metrics stay scoped and routing remains predictable.
-- Add CloudWatch alarms for Lambda errors, missing datapoints, stopped ECS tasks, failed deployments, high utilization, and worker connection failures.
-- Tighten IAM from broad ECS service permissions to the exact cluster/service ARNs once naming is stable.
-- Keep Application Auto Scaling as the scale-in authority so a custom controller does not terminate capacity too aggressively.
-- For EKS/Kubernetes, prefer the Cursor worker-set controller with Prometheus scraping worker `/metrics` and a scaler that patches `WorkerDeployment.spec.readyReplicas`. Validate HPA/KEDA-style controllers against the Cursor CRD before relying on them.
-- For burst-heavy teams, increase `ECS_MIN_CAPACITY` or `ECS_TARGET_IDLE_WORKERS`; Cursor's worker metrics do not expose queue depth before a session claims a worker.
+The ECS overview explains the control-loop trade-offs in more detail. For this implementation, confirm the metrics publisher is running and then apply the hardening checklist later in this guide before production rollout.
 
 Confirm the metrics publisher is running:
 

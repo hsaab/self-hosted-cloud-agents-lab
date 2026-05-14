@@ -2,14 +2,7 @@
 
 Use this approach to run Cursor self-hosted workers as ECS tasks, either on Fargate or on an ECS cluster backed by EC2 capacity.
 
-Use this guide to explain the ECS approach at a high level, including architecture, autoscaling, validation checks, operational trade-offs, and common troubleshooting paths.
-
-For step-by-step setup commands, see the detailed implementation guide in [`terraform/README.md`](terraform/README.md).
-
-## How To Use These Docs
-
-- Use this README for customer conversations, design review, autoscaling explanation, validation expectations, and troubleshooting.
-- Use [`terraform/README.md`](terraform/README.md) when you want the detailed implementation sequence and copy-paste commands.
+Use this guide for architecture, autoscaling behavior, validation expectations, operational trade-offs, and common troubleshooting paths. Use [`terraform/README.md`](terraform/README.md) for the step-by-step implementation runbook.
 
 ## Current Status
 
@@ -104,9 +97,9 @@ Larger enterprise deployments may prefer a more formal controller pattern:
 - On ECS/Fargate, keep this Lambda pattern but harden it with alarms, dashboards, least-privilege IAM, reserved concurrency only if the account quota supports it, and separate pools/services per team, repo, or environment.
 - For very bursty workloads, set `min_capacity` or `ECS_TARGET_IDLE_WORKERS` high enough to keep warm capacity. Cursor's current worker metrics show connected and active workers, but they do not expose queued demand before a session claims a worker.
 
-## Customer Flow
+## Setup Sequence
 
-At a high level, the ECS/Fargate path follows this order:
+At a high level, the ECS/Fargate path follows this order. See [`terraform/README.md`](terraform/README.md) for the exact commands and variables.
 
 1. Configure `.env` with AWS defaults, the Cursor service account key, the target repo, and an ECS-specific worker pool name.
 2. Apply Terraform to create ECS, ECR, IAM, Secrets Manager metadata, logs, metrics publishing, and autoscaling.
@@ -115,56 +108,9 @@ At a high level, the ECS/Fargate path follows this order:
 5. Force a new ECS deployment if the service started before the secret or image existed.
 6. Select the ECS self-hosted pool in Cursor Cloud Agents.
 
-See [`terraform/README.md`](terraform/README.md) for the exact commands.
-
-## Quick Commands
-
-The current `Makefile` has EC2 and Helm helpers, but the ECS path is run directly with Terraform and AWS CLI commands.
-
-```bash
-terraform -chdir=ecs/terraform init
-# Pass the ECS variables shown in terraform/README.md, or create a local tfvars file.
-terraform -chdir=ecs/terraform plan
-terraform -chdir=ecs/terraform apply
-aws secretsmanager put-secret-value \
-  --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" \
-  --secret-id "$CURSOR_API_KEY_SECRET_NAME" \
-  --secret-string "$CURSOR_API_KEY"
-make ecr-build-push
-```
-
-The ECS service may start before the secret value or first image exists. If tasks fail during the first boot, push the image, upload the secret, and force a new deployment:
-
-```bash
-aws ecs update-service \
-  --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" \
-  --cluster "$ECS_CLUSTER_NAME" \
-  --service "$ECS_SERVICE_NAME" \
-  --force-new-deployment
-```
-
 ## Validation
 
-Check the ECS service:
-
-```bash
-aws ecs describe-services \
-  --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" \
-  --cluster "$ECS_CLUSTER_NAME" \
-  --services "$ECS_SERVICE_NAME"
-```
-
-Check logs:
-
-```bash
-aws logs tail "${ECS_WORKER_LOG_GROUP_NAME:-/ecs/$ECS_SERVICE_NAME}" \
-  --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" \
-  --follow
-```
+Validate three layers: ECS service health, worker registration, and autoscaling metrics. The implementation guide includes the exact AWS CLI commands for each check.
 
 A healthy worker log includes:
 
@@ -175,20 +121,7 @@ Repo: <owner>/<repo>
 Pool: <pool-name>
 ```
 
-Check the autoscaling metric:
-
-```bash
-aws cloudwatch get-metric-statistics \
-  --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" \
-  --namespace "Cursor/SelfHostedWorkers" \
-  --metric-name "UtilizationPercent" \
-  --dimensions Name=PoolName,Value="${ECS_WORKER_POOL_NAME:-ecs-$CURSOR_WORKER_POOL_NAME}" Name=ClusterName,Value="$ECS_CLUSTER_NAME" Name=ServiceName,Value="$ECS_SERVICE_NAME" \
-  --start-time "$(date -u -v-15M +%Y-%m-%dT%H:%M:%SZ)" \
-  --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --period 60 \
-  --statistics Average
-```
+CloudWatch should show a service-scoped `UtilizationPercent` metric under `Cursor/SelfHostedWorkers` with `PoolName`, `ClusterName`, and `ServiceName` dimensions.
 
 ## Cleanup
 
@@ -226,51 +159,9 @@ The summary endpoint returns user and team counts. This ECS path uses the worker
 
 Symptom: one ECS worker is already claimed by a Cloud Agent session, a second session stays blocked, and ECS remains at `desired_count=1`.
 
-First check whether the autoscaling metric is service-scoped or accidentally team-wide. If the metrics publisher reports values like `inUse=2`, `connected=7`, and `utilizationPercent=28.6`, it is dividing by every connected self-hosted worker in the Cursor team, not just this ECS service. Target tracking will not scale out because the metric stays below the threshold even though the ECS pool itself is saturated.
+First confirm the autoscaling metric is service-scoped. If `connected` includes every self-hosted worker in the Cursor team instead of only this ECS service, utilization can look low even while this pool is saturated. The implementation guide includes the Lambda invocation and expected response shape for checking this.
 
-Use the metrics publisher output to verify the denominator:
-
-```bash
-aws lambda invoke \
-  --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" \
-  --function-name "${ECS_METRICS_PUBLISHER_NAME:-$ECS_SERVICE_NAME-metrics-publisher}" \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{}' \
-  /tmp/cursor-ecs-metrics-response.json
-
-cat /tmp/cursor-ecs-metrics-response.json
-```
-
-For a saturated single-task ECS service, the output should look like:
-
-```json
-{
-  "connected": 1,
-  "inUse": 1,
-  "idle": 0,
-  "utilizationPercent": 100.0,
-  "runningTasks": 1,
-  "matchedWorkers": 1
-}
-```
-
-If `connected` is much larger than the ECS service's running task count, update to the service-scoped publisher in this repo. It lists running ECS task private IPs, calls Cursor's worker list API, matches workers whose names contain those task IPs, and publishes `UtilizationPercent` for this ECS service only. Make sure the Lambda role includes `ecs:ListTasks` and `ecs:DescribeTasks`, then run:
-
-```bash
-terraform -chdir=ecs/terraform apply
-```
-
-After the metric is fixed, CloudWatch target-tracking alarms still need multiple fresh datapoints before scaling. For bursty demos, keep the fast step-scaling alarm enabled so a single saturated datapoint can add capacity. You can also temporarily unblock waiting sessions with:
-
-```bash
-aws ecs update-service \
-  --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" \
-  --cluster "$ECS_CLUSTER_NAME" \
-  --service "$ECS_SERVICE_NAME" \
-  --desired-count 2
-```
+After the metric is fixed, CloudWatch target-tracking alarms still need multiple fresh datapoints before scaling. For bursty demos, keep the fast step-scaling alarm enabled or temporarily raise the ECS service desired count.
 
 ### Burst Sessions Error Before New Tasks Are Ready
 
@@ -282,15 +173,7 @@ For customer demos that need no-wait bursts, set `min_capacity` to the expected 
 
 The metrics publisher only scales out. This avoids a Lambda racing against Application Auto Scaling and terminating workers while sessions are still active. Scale-in is handled by the target-tracking policy after the longer scale-in cooldown.
 
-If the service remains above the baseline after a burst, inspect the target-tracking low alarm and recent datapoints:
-
-```bash
-aws application-autoscaling describe-scaling-activities \
-  --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" \
-  --service-namespace ecs \
-  --resource-id "service/$ECS_CLUSTER_NAME/$ECS_SERVICE_NAME"
-```
+If the service remains above the baseline after a burst, inspect the target-tracking low alarm, recent datapoints, and Application Auto Scaling activity history.
 
 ### Scaling From Zero Has No Connected Denominator
 

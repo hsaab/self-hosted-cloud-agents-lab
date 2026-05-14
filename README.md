@@ -12,8 +12,8 @@ Workers connect outbound to Cursor over HTTPS. No inbound access to the worker i
 | ECS/Fargate | [`ecs/README.md`](ecs/README.md) | [`ecs/terraform/README.md`](ecs/terraform/README.md) |
 | EKS + Helm | [`eks/README.md`](eks/README.md) | [`eks/helm/README.md`](eks/helm/README.md) |
 
-For EC2 + Docker, start with the general README to understand the architecture, operating model, validation expectations, and troubleshooting. Use the implementation README when you want customer-facing setup commands for Terraform, Secrets Manager, ECR, validation, worker updates, key rotation, and cleanup.
+Use the general READMEs for architecture, trade-offs, validation expectations, and troubleshooting. Use the implementation READMEs when you need copy-paste setup commands.
 
-For ECS/Fargate, start with the general README to understand the architecture, autoscaling model, operational trade-offs, and troubleshooting. Use the implementation README when you want copy-paste setup commands for Terraform, Secrets Manager, ECR, validation, key rotation, and cleanup.
-
-The EKS guide covers the customer-facing flow. The Helm implementation assets live under `eks/helm/` so the Kubernetes controller, worker deployment, labels, and metrics autoscaling stay with the EKS approach.
+- EC2 + Docker is the smallest footprint and runs one worker container on one host.
+- ECS/Fargate is the AWS-native service path with CloudWatch metrics and ECS Service Auto Scaling.
+- EKS + Helm is the Kubernetes path using Cursor's worker-set controller and `WorkerDeployment` resources.
