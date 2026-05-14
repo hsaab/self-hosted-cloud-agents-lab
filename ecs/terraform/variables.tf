@@ -199,7 +199,19 @@ variable "min_capacity" {
 variable "max_capacity" {
   description = "Maximum ECS service desired count managed by Application Auto Scaling."
   type        = number
-  default     = 10
+  default     = 5
+}
+
+variable "target_idle_workers" {
+  description = "Number of idle connected ECS workers to keep available when dynamic scale-out runs."
+  type        = number
+  default     = 1
+}
+
+variable "enable_dynamic_scale_out" {
+  description = "Whether the metrics publisher should directly request ECS scale-out when no idle workers are available."
+  type        = bool
+  default     = true
 }
 
 variable "target_utilization_percent" {
@@ -244,8 +256,8 @@ variable "metrics_publisher_timeout_seconds" {
   default     = 30
 }
 
-variable "cursor_fleet_summary_url" {
-  description = "Cursor fleet summary API endpoint used by the metrics publisher."
+variable "cursor_workers_url" {
+  description = "Cursor worker list API endpoint used by the metrics publisher."
   type        = string
-  default     = "https://api.cursor.com/v0/private-workers/summary"
+  default     = "https://api.cursor.com/v0/private-workers"
 }

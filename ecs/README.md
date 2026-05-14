@@ -1,6 +1,15 @@
-# ECS Approach
+# ECS/Fargate Guide
 
 Use this approach to run Cursor self-hosted workers as ECS tasks, either on Fargate or on an ECS cluster backed by EC2 capacity.
+
+Use this guide to explain the ECS approach at a high level, including architecture, autoscaling, validation checks, operational trade-offs, and common troubleshooting paths.
+
+For step-by-step setup commands, see the detailed implementation guide in [`terraform/README.md`](terraform/README.md).
+
+## How To Use These Docs
+
+- Use this README for customer conversations, design review, autoscaling explanation, validation expectations, and troubleshooting.
+- Use [`terraform/README.md`](terraform/README.md) when you want the detailed implementation sequence and copy-paste commands.
 
 ## Current Status
 
@@ -12,7 +21,7 @@ This folder includes a Fargate-first Terraform deployment and a task definition 
 - Store the Cursor service account API key in Secrets Manager.
 - Run the worker as an ECS service where each task is one Cursor worker.
 - Give the task outbound HTTPS access to Cursor APIs, Cursor downloads, and Cursor cloud-agent artifacts.
-- Publish Cursor fleet utilization into CloudWatch and let ECS Service Auto Scaling adjust the service desired count.
+- Publish service-scoped Cursor worker utilization into CloudWatch, dynamically request scale-out when idle workers run out, and let ECS Service Auto Scaling handle steady-state scaling.
 
 Fargate is the default recommendation for teams that do not need privileged Docker, host-mounted caches, GPUs, or custom AMIs. Use ECS on EC2 when agents need CI-runner-style host control or specialized hardware. ECS on EC2 adds a second scaling loop because you must scale both the ECS service desired count and the underlying EC2 capacity provider.
 
@@ -32,30 +41,96 @@ For autoscaling, use worker occupancy:
 ```text
 idle_workers = connected_workers - active_sessions
 utilization_percent = active_sessions / connected_workers * 100
+recommended_capacity = connected_workers + max(target_idle_workers - idle_workers, 0)
 ```
 
 Do not scale out on `connected` alone. More connected workers means more capacity, so scaling up when `connected` increases creates a feedback loop. Use `connected` as the denominator for utilization and as an alert when ECS tasks are running but workers are not connected.
 
-This lab uses a scheduled Lambda metrics publisher instead of scraping every Fargate task. The publisher calls Cursor's fleet management API, writes `Connected`, `InUse`, `Idle`, and `UtilizationPercent` to CloudWatch, and ECS Service Auto Scaling target-tracks `UtilizationPercent`.
+This lab uses a scheduled Lambda metrics publisher instead of scraping every Fargate task. The publisher lists the ECS service's running task private IPs, calls Cursor's worker list API, matches Cursor workers whose names contain those task IPs, writes `Connected`, `InUse`, `Idle`, and `UtilizationPercent` to CloudWatch, and ECS Service Auto Scaling target-tracks `UtilizationPercent`.
+
+The Cursor summary endpoint is team-wide, so it should not be used directly when multiple self-hosted pools share the same Cursor team. A team-wide denominator can hide saturation in the ECS pool and prevent scale-out.
+
+The publisher also performs dynamic scale-out from the same metrics. When `Idle` falls below `ECS_TARGET_IDLE_WORKERS`, it calls `ecs:UpdateService` to increase desired count up to `max_capacity`. It only scales out; target tracking and the long scale-in cooldown handle scale-in after workers are idle.
 
 Good starting defaults:
 
 - `min_capacity`: `1` for demos, `2` for teams that need less cold-start latency.
-- `max_capacity`: `10` by default, bounded by the Cursor team worker limit and cost policy.
+- `max_capacity`: `5` by default, bounded by the Cursor team worker limit and cost policy.
+- `target_idle_workers`: `1`, so the service tries to keep one warm worker available.
 - `target_utilization_percent`: `75`.
 - Scale out cooldown: `60` seconds.
 - Scale in cooldown: `600` to `900` seconds.
 - `CURSOR_WORKER_IDLE_RELEASE_TIMEOUT`: `600`; ECS desired count is still the source of truth for fleet size.
 
+The Terraform path also adds a fast step-scaling alarm for bursty demos. AWS target tracking uses multiple evaluation periods, so it can be too slow when the service starts at one worker and several sessions arrive at once. Dynamic scale-out from the publisher is the fastest path; the fast alarm is a backup CloudWatch path, while target tracking still manages normal steady-state scaling and scale-in.
+
 The per-worker `/metrics` endpoint remains useful for dashboards and debugging. Scraping it from Fargate requires service discovery plus Prometheus, ADOT, or CloudWatch Agent plumbing, so it is a secondary path for this lab.
 
-## End-To-End Flow
+## How Metrics Publishing Works
+
+Terraform packages `terraform/metrics_publisher.py` as a Lambda function. EventBridge invokes it on `metrics_publish_schedule_expression`, which defaults to `rate(1 minute)`.
+
+Each run does four things:
+
+1. Reads the Cursor service account key from Secrets Manager.
+2. Lists running ECS tasks for this service and records their private IPs.
+3. Calls Cursor's worker list API and matches Cursor workers back to ECS tasks by private IP in the worker name.
+4. Publishes service-scoped metrics to CloudWatch under `Cursor/SelfHostedWorkers`.
+
+The Lambda publishes capacity and recommendation metrics:
+
+```text
+Connected
+InUse
+Idle
+UtilizationPercent
+DesiredCount
+RunningTasks
+RecommendedCapacity
+TargetIdleWorkers
+```
+
+When dynamic scale-out is enabled and the service has fewer idle workers than `ECS_TARGET_IDLE_WORKERS`, the Lambda calls `ecs:UpdateService` with a higher desired count, capped by `ECS_MAX_CAPACITY`. ECS then starts new Fargate tasks from the task definition. Those tasks pull the worker image, read the Cursor API key from Secrets Manager, initialize the git workspace, start `agent worker`, and register back into the configured Cursor pool.
+
+The Lambda does not scale in directly. Scale-in remains with Application Auto Scaling and the longer cooldown so active sessions are not interrupted by an aggressive controller.
+
+## Enterprise Guidance
+
+For ECS/Fargate, this scheduled Lambda pattern is a reasonable implementation when a team wants a simple AWS-native control loop without running Prometheus or a separate controller. It keeps secrets in Secrets Manager, metrics in CloudWatch, scaling in ECS/Application Auto Scaling, and the worker service private and outbound-only.
+
+Larger enterprise deployments may prefer a more formal controller pattern:
+
+- On Kubernetes or EKS, use the Cursor worker-set controller with Prometheus scraping worker `/metrics` and a scaler that patches `WorkerDeployment.spec.readyReplicas`. Plain HPA/KEDA can be blocked by CRD scale-selector requirements, so validate the chosen scaler against the Cursor CRD.
+- On ECS/Fargate, keep this Lambda pattern but harden it with alarms, dashboards, least-privilege IAM, reserved concurrency only if the account quota supports it, and separate pools/services per team, repo, or environment.
+- For very bursty workloads, set `min_capacity` or `ECS_TARGET_IDLE_WORKERS` high enough to keep warm capacity. Cursor's current worker metrics show connected and active workers, but they do not expose queued demand before a session claims a worker.
+
+## Customer Flow
+
+At a high level, the ECS/Fargate path follows this order:
+
+1. Configure `.env` with AWS defaults, the Cursor service account key, the target repo, and an ECS-specific worker pool name.
+2. Apply Terraform to create ECS, ECR, IAM, Secrets Manager metadata, logs, metrics publishing, and autoscaling.
+3. Upload the Cursor service account key into Secrets Manager.
+4. Build and push the worker image to ECR.
+5. Force a new ECS deployment if the service started before the secret or image existed.
+6. Select the ECS self-hosted pool in Cursor Cloud Agents.
+
+See [`terraform/README.md`](terraform/README.md) for the exact commands.
+
+## Quick Commands
+
+The current `Makefile` has EC2 and Helm helpers, but the ECS path is run directly with Terraform and AWS CLI commands.
 
 ```bash
-make ecs-terraform-init
-make ecs-terraform-plan
-make ecs-terraform-apply
-make ecs-put-api-key-secret
+terraform -chdir=ecs/terraform init
+# Pass the ECS variables shown in terraform/README.md, or create a local tfvars file.
+terraform -chdir=ecs/terraform plan
+terraform -chdir=ecs/terraform apply
+aws secretsmanager put-secret-value \
+  --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" \
+  --secret-id "$CURSOR_API_KEY_SECRET_NAME" \
+  --secret-string "$CURSOR_API_KEY"
 make ecr-build-push
 ```
 
@@ -120,7 +195,7 @@ aws cloudwatch get-metric-statistics \
 To stop AWS spend after a demo:
 
 ```bash
-make ecs-terraform-destroy
+terraform -chdir=ecs/terraform destroy
 ```
 
 Because this lab sets the ECR repository to force-delete, Terraform can remove the repository even if it contains demo images.
@@ -129,7 +204,15 @@ Because this lab sets the ECR repository to force-delete, Terraform can remove t
 
 ### Fargate Tasks Start Before The Image Or Secret Exists
 
-The ECS service pulls the configured image and injects the Secrets Manager value at task startup. If either is missing, tasks stop quickly. Upload the secret with `make ecs-put-api-key-secret`, push the image with `make ecr-build-push`, then force a new service deployment.
+The ECS service pulls the configured image and injects the Secrets Manager value at task startup. If either is missing, tasks stop quickly. Upload the secret with `aws secretsmanager put-secret-value`, push the image with `make ecr-build-push`, then force a new service deployment.
+
+### ECR Repository Already Exists
+
+If an existing demo repository uses the same `ECR_REPOSITORY_NAME`, either import it into `ecs/terraform` state or set `create_ecr_repository=false` and use the existing repository as a data source. Importing keeps cleanup behavior consistent with the lab.
+
+### Lambda Reserved Concurrency Fails
+
+Some sandbox accounts have a low regional Lambda concurrency quota. This lab does not reserve concurrency for the metrics publisher, because setting even one reserved execution can fail if it would drop the account's unreserved concurrency below AWS's minimum.
 
 ### Worker Directory Is Not A Git Repo
 
@@ -137,7 +220,77 @@ Cursor derives the repo label from the worker directory's git remote. Fargate ta
 
 ### Fleet API Metrics Are Team-Wide
 
-The summary endpoint returns user and team counts. For a single lab pool, team utilization is fine. For production with multiple pools, use one service account and pool per ECS service or switch the metrics publisher to list workers and filter by labels when the API exposes enough pool detail for your routing model.
+The summary endpoint returns user and team counts. This ECS path uses the worker list endpoint plus ECS task private IPs to isolate utilization to this service. If the Cursor API later exposes pool labels in list responses, prefer filtering directly by `pool` label.
+
+### ECS Pool Is Full But Autoscaling Does Not Add Tasks
+
+Symptom: one ECS worker is already claimed by a Cloud Agent session, a second session stays blocked, and ECS remains at `desired_count=1`.
+
+First check whether the autoscaling metric is service-scoped or accidentally team-wide. If the metrics publisher reports values like `inUse=2`, `connected=7`, and `utilizationPercent=28.6`, it is dividing by every connected self-hosted worker in the Cursor team, not just this ECS service. Target tracking will not scale out because the metric stays below the threshold even though the ECS pool itself is saturated.
+
+Use the metrics publisher output to verify the denominator:
+
+```bash
+aws lambda invoke \
+  --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" \
+  --function-name "${ECS_METRICS_PUBLISHER_NAME:-$ECS_SERVICE_NAME-metrics-publisher}" \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{}' \
+  /tmp/cursor-ecs-metrics-response.json
+
+cat /tmp/cursor-ecs-metrics-response.json
+```
+
+For a saturated single-task ECS service, the output should look like:
+
+```json
+{
+  "connected": 1,
+  "inUse": 1,
+  "idle": 0,
+  "utilizationPercent": 100.0,
+  "runningTasks": 1,
+  "matchedWorkers": 1
+}
+```
+
+If `connected` is much larger than the ECS service's running task count, update to the service-scoped publisher in this repo. It lists running ECS task private IPs, calls Cursor's worker list API, matches workers whose names contain those task IPs, and publishes `UtilizationPercent` for this ECS service only. Make sure the Lambda role includes `ecs:ListTasks` and `ecs:DescribeTasks`, then run:
+
+```bash
+terraform -chdir=ecs/terraform apply
+```
+
+After the metric is fixed, CloudWatch target-tracking alarms still need multiple fresh datapoints before scaling. For bursty demos, keep the fast step-scaling alarm enabled so a single saturated datapoint can add capacity. You can also temporarily unblock waiting sessions with:
+
+```bash
+aws ecs update-service \
+  --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER_NAME" \
+  --service "$ECS_SERVICE_NAME" \
+  --desired-count 2
+```
+
+### Burst Sessions Error Before New Tasks Are Ready
+
+The available Cursor metrics show connected workers and active sessions, not queued or blocked sessions. If three users start sessions while the service has only one connected worker, the scaler can only react after that first worker becomes active and the next scheduled metrics publisher run observes `Idle=0`.
+
+For customer demos that need no-wait bursts, set `min_capacity` to the expected simultaneous session count. For cost-conscious defaults, keep `min_capacity=1`, `target_idle_workers=1`, and explain that new Fargate tasks still need time to start, run the container entrypoint, connect to Cursor, and register in the selected pool.
+
+### Dynamic Scale-Out Does Not Reduce Desired Count
+
+The metrics publisher only scales out. This avoids a Lambda racing against Application Auto Scaling and terminating workers while sessions are still active. Scale-in is handled by the target-tracking policy after the longer scale-in cooldown.
+
+If the service remains above the baseline after a burst, inspect the target-tracking low alarm and recent datapoints:
+
+```bash
+aws application-autoscaling describe-scaling-activities \
+  --profile "$AWS_PROFILE" \
+  --region "$AWS_REGION" \
+  --service-namespace ecs \
+  --resource-id "service/$ECS_CLUSTER_NAME/$ECS_SERVICE_NAME"
+```
 
 ### Scaling From Zero Has No Connected Denominator
 
@@ -146,197 +299,6 @@ If `min_capacity` is `0`, there may be no connected worker count to divide by. K
 ### Service Auto Scaling Changes Desired Count
 
 Terraform creates the initial ECS service desired count, then ignores later desired count drift so Application Auto Scaling can manage it. Change `min_capacity`, `max_capacity`, or the scaling policy instead of repeatedly forcing `desired_count` back with Terraform.
-
-## Customer Implementation Guide
-
-Use this sequence when helping a customer implement the ECS/Fargate path from scratch.
-
-### 1. Confirm Prerequisites
-
-Confirm the customer has:
-
-- Cursor Enterprise with Self-Hosted Cloud Agents enabled.
-- A Cursor service account API key for pool workers.
-- The Cursor GitHub App installed for the target repo owner and repository.
-- AWS CLI, Docker, Terraform, and permissions to create ECS, ECR, IAM, Lambda, EventBridge, CloudWatch, Secrets Manager, and security group resources.
-- A VPC with outbound internet access. The default lab path uses public subnets with `ECS_ASSIGN_PUBLIC_IP=true`; private subnets need NAT or equivalent egress.
-
-### 2. Configure Environment
-
-Copy the example environment file and fill in customer-specific values:
-
-```bash
-cp .env.example .env
-```
-
-Set at least:
-
-```bash
-AWS_PROFILE=customer-profile
-AWS_REGION=us-east-1
-CURSOR_API_KEY=replace-with-service-account-api-key
-CURSOR_WORKER_POOL_NAME=customer-pool
-ECS_WORKER_POOL_NAME=ecs-customer-pool
-WORKER_ENVIRONMENT_LABEL=production
-WORKER_OWNER_LABEL=platform-team
-ECS_WORKER_INFRASTRUCTURE_LABEL=ecs
-CURSOR_API_KEY_SECRET_NAME=customer/cursor-service-account-key
-ECS_CLUSTER_NAME=cursor-agents
-ECS_SERVICE_NAME=cursor-worker-service
-ECS_TASK_FAMILY=cursor-self-hosted-worker
-WORKER_REPOSITORY_URL=https://github.com/OWNER/REPO.git
-```
-
-Size the worker like a CI runner for the repository:
-
-```bash
-ECS_TASK_CPU=1024
-ECS_TASK_MEMORY=2048
-ECS_MIN_CAPACITY=1
-ECS_MAX_CAPACITY=10
-ECS_TARGET_UTILIZATION_PERCENT=75
-```
-
-Use an ECS-specific pool name, such as `ecs-customer-pool`, so the worker is easy to identify in the Cursor Cloud Agents dashboard. The Makefile defaults `ECS_WORKER_POOL_NAME` to `ecs-$(CURSOR_WORKER_POOL_NAME)` when it is not set explicitly. The ECS task also passes custom labels through `CURSOR_WORKER_LABELS_JSON`, so Cursor should show labels like `infrastructure=ecs`, `runtime=ecs-fargate`, `environment=production`, and `owner=platform-team`.
-
-If using Graviton/Fargate ARM, also set:
-
-```bash
-WORKER_PLATFORM=linux/arm64
-ECS_TASK_CPU_ARCHITECTURE=ARM64
-```
-
-### 3. Review The Terraform Plan
-
-Initialize and plan without applying:
-
-```bash
-make ecs-terraform-init
-make ecs-terraform-plan
-```
-
-Confirm the plan creates only the expected lab resources: ECS cluster/service/task definition, ECR repository, Secrets Manager secret container, IAM roles and policies, CloudWatch log groups, Lambda metrics publisher, EventBridge schedule, security group, and Application Auto Scaling target/policy.
-
-### 4. Apply Infrastructure
-
-Apply once the customer approves the plan:
-
-```bash
-make ecs-terraform-apply
-```
-
-Terraform creates the secret container but not the API key value. That keeps the service account key out of Terraform state.
-
-### 5. Upload Secret And Push Image
-
-Upload the service account key:
-
-```bash
-make ecs-put-api-key-secret
-```
-
-Build and push the worker image:
-
-```bash
-make ecr-build-push
-```
-
-If the ECS service started before the secret or image existed, force a new deployment:
-
-```bash
-aws ecs update-service \
-  --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" \
-  --cluster "$ECS_CLUSTER_NAME" \
-  --service "$ECS_SERVICE_NAME" \
-  --force-new-deployment
-```
-
-### 6. Verify Worker Health
-
-Check service state:
-
-```bash
-aws ecs describe-services \
-  --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" \
-  --cluster "$ECS_CLUSTER_NAME" \
-  --services "$ECS_SERVICE_NAME" \
-  --query "services[0].{desired:desiredCount,running:runningCount,pending:pendingCount,events:events[0:5]}"
-```
-
-Tail worker logs:
-
-```bash
-aws logs tail "${ECS_WORKER_LOG_GROUP_NAME:-/ecs/$ECS_SERVICE_NAME}" \
-  --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" \
-  --follow
-```
-
-Confirm the worker appears in the Cursor Cloud Agents dashboard under the configured pool. Start a test Cloud Agent run with the pool selected.
-
-### 7. Verify Autoscaling Metrics
-
-Confirm the metrics publisher is running:
-
-```bash
-aws logs tail "/aws/lambda/${ECS_METRICS_PUBLISHER_NAME:-$ECS_SERVICE_NAME-metrics-publisher}" \
-  --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" \
-  --since 15m
-```
-
-Check CloudWatch for utilization:
-
-```bash
-aws cloudwatch get-metric-statistics \
-  --profile "$AWS_PROFILE" \
-  --region "$AWS_REGION" \
-  --namespace "${ECS_METRICS_NAMESPACE:-Cursor/SelfHostedWorkers}" \
-  --metric-name "UtilizationPercent" \
-  --dimensions Name=PoolName,Value="${ECS_WORKER_POOL_NAME:-ecs-$CURSOR_WORKER_POOL_NAME}" Name=ClusterName,Value="$ECS_CLUSTER_NAME" Name=ServiceName,Value="$ECS_SERVICE_NAME" \
-  --start-time "$(date -u -v-15M +%Y-%m-%dT%H:%M:%SZ)" \
-  --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --period 60 \
-  --statistics Average
-```
-
-Autoscaling should add capacity when `UtilizationPercent` stays above the target and remove capacity slowly after sustained lower utilization.
-
-### 8. Production Hardening Checklist
-
-Before production rollout, decide:
-
-- Whether to use private subnets with NAT or VPC endpoints instead of public task ENIs.
-- Whether each repo, team, or environment should get a separate pool and ECS service.
-- Whether `ECS_MIN_CAPACITY` should be `2` or higher for warm standby capacity.
-- Whether workers need ECS on EC2 instead of Fargate for privileged Docker, host caches, GPUs, larger local disks, or custom AMIs.
-- Whether to add customer-standard alarms for failed ECS deployments, stopped tasks, Lambda errors, missing metrics, high utilization, and worker connection failures.
-
-### 9. Troubleshooting
-
-If tasks are stopped with image pull errors, run `make ecr-build-push` and confirm `ECR_REPOSITORY_NAME`, `WORKER_IMAGE_TAG`, `WORKER_PLATFORM`, and `ECS_TASK_CPU_ARCHITECTURE` match.
-
-If tasks are stopped with secret injection errors, run `make ecs-put-api-key-secret` and confirm `CURSOR_API_KEY_SECRET_NAME` matches the Terraform output.
-
-If worker logs say the worker directory is not a git repo, confirm `WORKER_REPOSITORY_URL` is set. The container entrypoint initializes `/workspace` using that remote.
-
-If the worker connects but no jobs arrive, confirm the Cursor dashboard is selecting the ECS-specific pool from `ECS_WORKER_POOL_NAME`, and confirm the GitHub App has access to the target repo.
-
-If metrics are missing, inspect the Lambda logs and confirm the service account key is valid. The metrics publisher uses the Cursor fleet summary API and writes CloudWatch metrics with `PoolName`, `ClusterName`, and `ServiceName` dimensions.
-
-If autoscaling does not change desired count, check the Application Auto Scaling target and target-tracking policy, then confirm `UtilizationPercent` has recent CloudWatch datapoints. Target tracking does not act on missing data.
-
-### 10. Teardown
-
-For demos and proofs of concept, tear down the ECS path when finished:
-
-```bash
-make ecs-terraform-destroy
-```
-
-This deletes the ECS service, task definition resources, ECR repository, IAM roles, log groups, Lambda metrics publisher, EventBridge schedule, security group, and secret container managed by this Terraform root.
 
 ## Files
 

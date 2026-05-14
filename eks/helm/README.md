@@ -90,7 +90,7 @@ Pool: hsaab-worker-pool
 
 `make helm-create-api-key-secret` creates the API key secret from `CURSOR_API_KEY` and labels it for the `WorkerDeployment`. This keeps the secret value out of checked-in YAML.
 
-`make helm-apply` creates the namespace, applies the labels ConfigMap from `helm/labels.json`, and applies a generated `WorkerDeployment`. The pod has:
+`make helm-apply` creates the namespace, applies the labels ConfigMap from `eks/helm/labels.json`, and applies a generated `WorkerDeployment`. The pod has:
 
 1. An init container that initializes `/workspace` as a git repo and sets `origin` to `WORKER_REPOSITORY_URL`.
 2. A worker container that starts `agent worker --pool --pool-name "$CURSOR_WORKER_POOL_NAME"`.
@@ -134,6 +134,28 @@ After changing Docker files or the entrypoint, build and push a new image, then 
 make ecr-build-push
 K8S_WORKER_IMAGE="<registry>/<repo>:<tag>" make helm-apply
 ```
+
+To support multiple concurrent Cloud Agent sessions, set `WORKER_READY_REPLICAS` to at least the desired concurrency:
+
+```bash
+WORKER_READY_REPLICAS=2 make helm-apply
+kubectl get workerdeployments -n "$K8S_NAMESPACE"
+```
+
+A single worker can only take one active job at a time. Start customer demos at `WORKER_READY_REPLICAS=2`, then scale higher when the customer expects more simultaneous sessions:
+
+```bash
+WORKER_READY_REPLICAS=5 make helm-apply
+kubectl get workerdeployments -n "$K8S_NAMESPACE"
+```
+
+To automate that scaling from Cursor worker metrics, install the Prometheus-based scaler:
+
+```bash
+make helm-install-autoscaling
+```
+
+This creates a `cursor-worker-metrics` Service for the worker `/metrics` endpoint, installs Prometheus, and runs a scaler CronJob that reads `cursor_self_hosted_worker_connected` and `cursor_self_hosted_worker_session_active`. The scaler patches `WorkerDeployment.spec.readyReplicas` between `WORKER_MIN_REPLICAS` and `WORKER_MAX_REPLICAS`.
 
 After rotating the service account key:
 
@@ -196,6 +218,42 @@ If `kubectl apply` reports that `WorkerDeployment` is not recognized, the contro
 make helm-install-controller
 kubectl get crd | rg workers.cursor.com
 ```
+
+### Scaling Does Not Reach The Desired Worker Count
+
+If `WORKER_READY_REPLICAS=5 make helm-apply` does not result in `READY 5`, inspect the worker pods and events:
+
+```bash
+kubectl get workerdeployments -n "$K8S_NAMESPACE"
+kubectl get pods -n "$K8S_NAMESPACE" -l app=cursor-self-hosted-worker -o wide
+kubectl get events -n "$K8S_NAMESPACE" --sort-by=.lastTimestamp
+```
+
+Typical blockers are node CPU or memory capacity, VPC CNI IP exhaustion on EKS, image pull errors, node taints, and missing cluster autoscaling. Add capacity or enable autoscaling before increasing the ready worker target for sustained use.
+
+If the pool remains at `READY 2`, confirm the `WorkerDeployment` desired count changed. Cluster autoscaling only adds Kubernetes nodes for unschedulable pods; it does not change `readyReplicas` from 2 to 5 automatically.
+
+### Metrics Autoscaler Does Not Scale
+
+Confirm Prometheus is scraping the workers:
+
+```bash
+kubectl exec -n prometheus deploy/prometheus-server -c prometheus-server -- \
+  wget -qO- 'http://localhost:9090/api/v1/query?query=sum(cursor_self_hosted_worker_connected{namespace="'$K8S_NAMESPACE'"})'
+```
+
+Confirm the scaler CronJob is running:
+
+```bash
+kubectl get cronjob -n "$K8S_NAMESPACE" cursor-worker-metrics-scaler
+kubectl get jobs -n "$K8S_NAMESPACE" | rg cursor-worker-metrics-scaler
+```
+
+If Prometheus is pending with an unbound PVC, install with the repo helper. It disables Prometheus persistence for the lab so EKS clusters without a default StorageClass still work. If the scaler logs show `connected=0`, check that workers are started with `--management-addr 0.0.0.0:8080` and that the `cursor-worker-metrics` Service has endpoints.
+
+Do not use a plain HPA or KEDA `ScaledObject` directly against `WorkerDeployment` without validating it first. The Cursor CRD exposes `/scale`, but its scale status does not include a selector, and Kubernetes HPA can reject the target with `selector is required`. The repo helper uses a CronJob scaler that patches the `WorkerDeployment` scale endpoint directly.
+
+Prometheus can briefly retain metrics for deleted worker pods. The scaler filters metrics through the live `up{service="cursor-worker-metrics"}` targets so deleted pods do not inflate the connected-worker denominator.
 
 ### Initial Kind Scheduling Warning
 

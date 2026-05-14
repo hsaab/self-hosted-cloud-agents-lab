@@ -143,6 +143,17 @@ data "aws_iam_policy_document" "metrics_publisher" {
       values   = [var.metrics_namespace]
     }
   }
+
+  statement {
+    sid = "ReadEcsServiceTasks"
+    actions = [
+      "ecs:DescribeServices",
+      "ecs:DescribeTasks",
+      "ecs:ListTasks",
+      "ecs:UpdateService"
+    ]
+    resources = ["*"]
+  }
 }
 
 data "archive_file" "metrics_publisher" {
@@ -407,25 +418,67 @@ resource "aws_appautoscaling_policy" "worker_utilization" {
   }
 }
 
+resource "aws_appautoscaling_policy" "worker_fast_scale_out" {
+  name               = "${var.ecs_service_name}-cursor-fast-scale-out"
+  policy_type        = "StepScaling"
+  resource_id        = aws_appautoscaling_target.worker.resource_id
+  scalable_dimension = aws_appautoscaling_target.worker.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.worker.service_namespace
+
+  step_scaling_policy_configuration {
+    adjustment_type         = "ChangeInCapacity"
+    cooldown                = var.scale_out_cooldown_seconds
+    metric_aggregation_type = "Average"
+
+    step_adjustment {
+      metric_interval_lower_bound = 0
+      scaling_adjustment          = 1
+    }
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "worker_fast_scale_out" {
+  alarm_name          = "${var.ecs_service_name}-cursor-fast-scale-out"
+  alarm_description   = "Adds ECS worker capacity quickly when all service-scoped Cursor workers are busy."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "UtilizationPercent"
+  namespace           = var.metrics_namespace
+  period              = 60
+  statistic           = "Average"
+  threshold           = var.target_utilization_percent
+  treat_missing_data  = "notBreaching"
+  unit                = "Percent"
+
+  dimensions = local.metric_dimensions
+  alarm_actions = [
+    aws_appautoscaling_policy.worker_fast_scale_out.arn
+  ]
+}
+
 resource "aws_lambda_function" "metrics_publisher" {
-  function_name                  = var.metrics_publisher_name
-  description                    = "Publishes Cursor self-hosted worker fleet utilization to CloudWatch."
-  role                           = aws_iam_role.metrics_publisher.arn
-  handler                        = "metrics_publisher.handler"
-  runtime                        = "python3.12"
-  filename                       = data.archive_file.metrics_publisher.output_path
-  source_code_hash               = data.archive_file.metrics_publisher.output_base64sha256
-  timeout                        = var.metrics_publisher_timeout_seconds
-  memory_size                    = 128
-  reserved_concurrent_executions = 1
+  function_name    = var.metrics_publisher_name
+  description      = "Publishes Cursor self-hosted worker fleet utilization to CloudWatch."
+  role             = aws_iam_role.metrics_publisher.arn
+  handler          = "metrics_publisher.handler"
+  runtime          = "python3.12"
+  filename         = data.archive_file.metrics_publisher.output_path
+  source_code_hash = data.archive_file.metrics_publisher.output_base64sha256
+  timeout          = var.metrics_publisher_timeout_seconds
+  memory_size      = 128
 
   environment {
     variables = {
       CURSOR_API_KEY_SECRET_ARN = local.cursor_api_key_secret_arn
-      CURSOR_POOL_NAME          = var.worker_pool_name
-      CURSOR_FLEET_SUMMARY_URL  = var.cursor_fleet_summary_url
+      CURSOR_WORKERS_URL        = var.cursor_workers_url
+      ECS_CLUSTER_NAME          = local.cluster_name
+      ECS_SERVICE_NAME          = var.ecs_service_name
+      ENABLE_DYNAMIC_SCALE_OUT  = tostring(var.enable_dynamic_scale_out)
+      MAX_CAPACITY              = tostring(var.max_capacity)
+      MIN_CAPACITY              = tostring(var.min_capacity)
       METRICS_NAMESPACE         = var.metrics_namespace
       METRIC_DIMENSIONS         = jsonencode(local.metric_dimensions)
+      TARGET_IDLE_WORKERS       = tostring(var.target_idle_workers)
     }
   }
 

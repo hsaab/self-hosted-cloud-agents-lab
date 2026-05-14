@@ -45,7 +45,6 @@ ${cursor_api_key_env_name}=$${CURSOR_API_KEY}
 CURSOR_WORKER_POOL_NAME=${worker_pool_name}
 CURSOR_WORKER_IDLE_RELEASE_TIMEOUT=${worker_idle_release_timeout}
 CURSOR_WORKER_LABELS_FILE=/etc/cursor/labels.json
-CURSOR_WORKER_LABELS_JSON='${worker_labels_json}'
 %{ if cursor_worker_management_addr != "" ~}
 CURSOR_WORKER_MANAGEMENT_ADDR=${cursor_worker_management_addr}
 %{ endif ~}

@@ -29,12 +29,6 @@ locals {
   subnet_id       = var.subnet_id != null ? var.subnet_id : sort(data.aws_subnets.default[0].ids)[0]
   worker_image    = "${aws_ecr_repository.worker.repository_url}:${var.worker_image_tag}"
   secret_env_name = "CURSOR_API_KEY"
-  worker_labels = {
-    environment    = var.worker_environment_label
-    infrastructure = var.worker_infrastructure_label
-    runtime        = "ec2-docker"
-    owner          = var.worker_owner_label
-  }
 }
 
 data "aws_caller_identity" "current" {}
@@ -178,7 +172,6 @@ resource "aws_instance" "worker" {
     worker_pool_name              = var.worker_pool_name
     worker_idle_release_timeout   = var.worker_idle_release_timeout
     worker_repository_url         = var.worker_repository_url
-    worker_labels_json            = jsonencode(local.worker_labels)
     cursor_api_key_secret_id      = aws_secretsmanager_secret.cursor_api_key.id
     cursor_api_key_env_name       = local.secret_env_name
     cursor_worker_management_addr = var.cursor_worker_management_addr

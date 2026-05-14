@@ -49,15 +49,17 @@ AWS_ACCOUNT_ID=<your-aws-account-id>
 ECR_REPOSITORY_NAME=cursor-self-hosted-worker
 
 CURSOR_API_KEY=<cursor-service-account-api-key>
-CURSOR_WORKER_POOL_NAME=<cursor-worker-pool-name>
+CURSOR_WORKER_POOL_NAME=<customer-or-team>-eks-worker-pool
 CURSOR_WORKER_IDLE_RELEASE_TIMEOUT=600
 
-K8S_NAMESPACE=cursord
-WORKER_DEPLOYMENT_NAME=my-workers
-WORKER_READY_REPLICAS=1
+K8S_NAMESPACE=<customer-or-team>-eks-worker-pool
+WORKER_DEPLOYMENT_NAME=<customer-or-team>-eks-worker-deployment
+WORKER_READY_REPLICAS=2
 CURSOR_API_KEY_SECRET_NAME=my-workers-api-key
-K8S_WORKER_LABELS_FILE=helm/labels.json
+K8S_WORKER_LABELS_FILE=eks/helm/labels.json
 ```
+
+Use a pool name that includes `eks`, such as `acme-eks-worker-pool`, so the pool is easy to identify in Cursor's Self Hosted picker.
 
 Set `WORKER_REPOSITORY_URL` if the local repo remote is not the customer repo that Cloud Agents should work on:
 
@@ -210,6 +212,16 @@ Pool: <pool-name>
 
 Then open Cursor Cloud Agents, choose **Self Hosted**, and start a test job against the repo that matches `WORKER_REPOSITORY_URL`.
 
+The live EKS validation in this repo used:
+
+```text
+EKS cluster: cursor-agents-lab
+EKS namespace: hsaab-eks-worker-pool
+WorkerDeployment: hsaab-eks-worker-deployment
+Worker image: 500766168271.dkr.ecr.us-east-1.amazonaws.com/cursor-self-hosted-worker:latest
+Cursor pool: hsaab-eks-worker-pool
+```
+
 ## Step 9: Update Or Scale Workers
 
 To change the worker image:
@@ -225,6 +237,26 @@ To change the number of ready workers:
 WORKER_READY_REPLICAS=2 make helm-apply
 kubectl get workerdeployments -n "$K8S_NAMESPACE"
 ```
+
+Set `WORKER_READY_REPLICAS` to at least the number of concurrent Cloud Agent sessions you want the pool to handle. A single worker can only take one active job at a time, so start customer demos at `WORKER_READY_REPLICAS=2` and scale up if more simultaneous sessions are expected.
+
+To scale the same pool to 5 ready workers:
+
+```bash
+WORKER_READY_REPLICAS=5 make helm-apply
+kubectl get workerdeployments -n "$K8S_NAMESPACE"
+kubectl get pods -n "$K8S_NAMESPACE" -l app=cursor-self-hosted-worker
+```
+
+If 5 workers should be the steady state, update `WORKER_READY_REPLICAS=5` in `.env` after confirming the cluster has enough capacity.
+
+To scale automatically from Cursor worker metrics, install the Prometheus-based scaler:
+
+```bash
+make helm-install-autoscaling
+```
+
+This installs Prometheus without persistent storage, creates a `cursor-worker-metrics` Service for the worker `/metrics` endpoint, and runs a scaler CronJob. The CronJob reads `cursor_self_hosted_worker_connected` and `cursor_self_hosted_worker_session_active`, then patches `WorkerDeployment.spec.readyReplicas` between `WORKER_MIN_REPLICAS=2` and `WORKER_MAX_REPLICAS=5`.
 
 To rotate the Cursor service account key:
 
@@ -297,6 +329,70 @@ kubectl delete pod -n "$K8S_NAMESPACE" -l app=cursor-self-hosted-worker
 ### Worker Is Running But Jobs Do Not Start
 
 Check that the pool name in Cursor matches `CURSOR_WORKER_POOL_NAME`, the repo in the worker logs matches the intended repo, and the Cursor GitHub App has access to that repo.
+
+If the first job starts but a second concurrent job waits or fails to assign, check `kubectl get workerdeployments -n "$K8S_NAMESPACE"`. Increase `WORKER_READY_REPLICAS` when `READY` is lower than the number of concurrent sessions you expect.
+
+### Pool Does Not Automatically Grow From 2 To 5
+
+`WORKER_READY_REPLICAS=2` means the controller keeps 2 ready workers. To make the pool grow automatically, install the metrics scaler:
+
+```bash
+make helm-install-autoscaling
+```
+
+You can still scale manually when you expect more concurrent jobs:
+
+```bash
+WORKER_READY_REPLICAS=5 make helm-apply
+kubectl get workerdeployments -n "$K8S_NAMESPACE"
+```
+
+EKS cluster autoscaling, Karpenter, or Cluster Autoscaler only add nodes when Kubernetes has unschedulable pods. They do not increase the `WorkerDeployment` replica target by themselves.
+
+### Metrics Autoscaler Does Not Scale
+
+Confirm Prometheus is scraping the workers:
+
+```bash
+kubectl exec -n prometheus deploy/prometheus-server -c prometheus-server -- \
+  wget -qO- 'http://localhost:9090/api/v1/query?query=sum(cursor_self_hosted_worker_connected{namespace="'$K8S_NAMESPACE'"})'
+
+kubectl exec -n prometheus deploy/prometheus-server -c prometheus-server -- \
+  wget -qO- 'http://localhost:9090/api/v1/query?query=sum(cursor_self_hosted_worker_session_active{namespace="'$K8S_NAMESPACE'"})'
+```
+
+Confirm the scaler CronJob is running and inspect its latest log:
+
+```bash
+kubectl get cronjob -n "$K8S_NAMESPACE" cursor-worker-metrics-scaler
+kubectl get jobs -n "$K8S_NAMESPACE" | rg cursor-worker-metrics-scaler
+kubectl logs -n "$K8S_NAMESPACE" job/<latest-scaler-job-name>
+```
+
+If Prometheus is pending with an unbound PVC, reinstall with `make helm-install-autoscaling`; the helper disables Prometheus persistence for this lab. If the scaler logs show `connected=0`, check that workers are started with `--management-addr 0.0.0.0:8080` and that `kubectl get endpoints -n "$K8S_NAMESPACE" cursor-worker-metrics` lists worker pod IPs. If the scaler patches replicas but pods stay pending, fix node capacity, subnet IP capacity, or cluster autoscaling.
+
+Do not use a plain HPA or KEDA `ScaledObject` directly against `WorkerDeployment` without validating it first. The Cursor CRD exposes `/scale`, but its scale status does not include a selector, and Kubernetes HPA can reject the target with `selector is required`. The repo helper uses a CronJob scaler that patches the `WorkerDeployment` scale endpoint directly.
+
+Prometheus can briefly retain metrics for deleted worker pods. The scaler filters metrics through the live `up{service="cursor-worker-metrics"}` targets so deleted pods do not inflate the connected-worker denominator.
+
+### Scaling To 5 Does Not Create 5 Ready Workers
+
+First confirm the desired count changed:
+
+```bash
+kubectl get workerdeployments -n "$K8S_NAMESPACE"
+kubectl describe workerdeployment "$WORKER_DEPLOYMENT_NAME" -n "$K8S_NAMESPACE"
+```
+
+If `DESIRED` is 5 but `READY` stays lower, inspect pods and events:
+
+```bash
+kubectl get pods -n "$K8S_NAMESPACE" -l app=cursor-self-hosted-worker -o wide
+kubectl describe pods -n "$K8S_NAMESPACE" -l app=cursor-self-hosted-worker
+kubectl get events -n "$K8S_NAMESPACE" --sort-by=.lastTimestamp
+```
+
+Common blockers are insufficient node CPU or memory, VPC CNI IP exhaustion, EC2 instance or subnet capacity limits, ECR image pull failures, node taints, and missing cluster autoscaler or Karpenter capacity. If pods are `Pending`, add nodes or enable autoscaling before increasing `WORKER_READY_REPLICAS`. If pods are `ImagePullBackOff`, fix the ECR image URI or node ECR permissions.
 
 ### Worker Cannot Reach Cursor
 
